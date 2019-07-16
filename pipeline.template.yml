@@ -1,0 +1,201 @@
+Parameters:
+  GithubAccessToken:
+    Type: String
+    NoEcho: true
+    Description: OAuth token for GitHub
+  GithubOwner:
+    Type: String
+    Default: sourceallies
+    Description: Name of the owner of the GitHub repository
+  GithubRepo:
+    Type: String
+    Default: zonebeacon
+    Description: Name of the GitHub repository
+  GithubBranch:
+    Type: String
+    Default: codepipeline
+    Description: Name of the branch to track in the Github repo
+  DevAccountId:
+    Type: String
+    Description: Id of the dev account
+    Default: "729161019481"
+  QualAccountId:
+    Type: String
+    Description: Id of the qual account
+    Default: "035409092456"
+  ProdAccountId:
+    Type: String
+    Description: Id of the prod account
+    Default: "487696863217"
+Resources:
+  ArtifactStore:
+    Type: AWS::S3::Bucket
+  ArtifactStorePolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactStore
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: s3:*
+            Resource:
+              - !Sub arn:aws:s3:::${ArtifactStore}
+              - !Sub arn:aws:s3:::${ArtifactStore}/*
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${AWS::AccountId}:role/Pipeline
+                - !Sub arn:aws:iam::${DevAccountId}:role/Deployer
+                - !Sub arn:aws:iam::${QualAccountId}:role/Deployer
+                - !Sub arn:aws:iam::${ProdAccountId}:role/Deployer
+              Service:
+                - lambda.amazonaws.com
+  ArtifactKey: #Needed to allow Dev/Qual/Prod to decrypt artifacts in the Shared account's ArtifactStore
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Key used for encrypting artifacts
+      KeyPolicy:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - kms:*
+            Resource: "*"
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${AWS::AccountId}:root
+                - !Sub arn:aws:iam::${DevAccountId}:role/Deployer
+                - !Sub arn:aws:iam::${QualAccountId}:role/Deployer
+                - !Sub arn:aws:iam::${ProdAccountId}:role/Deployer
+  # BranchedBuildProject:
+  #   Type: AWS::CodeBuild::Project
+  #   Properties:
+  #     Name: !Sub ${AWS::StackName}-branched-build
+  #     ServiceRole: !Sub arn:aws:iam::${AWS::AccountId}:role/Pipeline
+  #     EncryptionKey: !GetAtt ArtifactKey.Arn
+  #     Environment:
+  #       Type: LINUX_CONTAINER
+  #       ComputeType: BUILD_GENERAL1_SMALL
+  #       Image: !ImportValue aws-shared-services-pipeline-BuildEnvImage
+  #       EnvironmentVariables:
+  #         - Name: ARTIFACT_STORE
+  #           Value: !Ref ArtifactStore
+  #         - Name: REPOSITORY_URI
+  #           Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${DockerRepo}
+  #         - Name: DEV_ACCOUNT_ID
+  #           Value: !Ref DevAccountId
+  #         - Name: QUAL_ACCOUNT_ID
+  #           Value: !Ref QualAccountId
+  #         - Name: PROD_ACCOUNT_ID
+  #           Value: !Ref ProdAccountId
+  #     Source:
+  #       Type: GITHUB
+  #       Location: !Sub https://github.com/${GithubOwner}/${GithubRepo}.git
+  #       ReportBuildStatus: true
+  #     Artifacts:
+  #       Type: NO_ARTIFACTS
+  #     Triggers:
+  #       Webhook: true
+  #       FilterGroups:
+  #         - - Pattern: ^refs/heads/master$
+  #             ExcludeMatchedPattern: true
+  #             Type: HEAD_REF
+  #           - Pattern: PUSH,PULL_REQUEST_CREATED,PULL_REQUEST_UPDATED,PULL_REQUEST_REOPENED
+  #             Type: EVENT
+  DockerRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryPolicyText:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowSelfFullAccess
+            Effect: Allow
+            Action: ecr:*
+            Principal:
+              AWS: !Ref AWS::AccountId
+          - Sid: AllowSubReadAccess
+            Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:GetRepositoryPolicy
+              - ecr:DescribeRepositories
+              - ecr:ListImages
+              - ecr:DescribeImages
+              - ecr:BatchGetImage
+            Principal:
+              AWS:
+                - !Ref DevAccountId
+                - !Ref QualAccountId
+                - !Ref ProdAccountId
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-build
+      ServiceRole: !Sub arn:aws:iam::${AWS::AccountId}:role/Pipeline
+      EncryptionKey: !GetAtt ArtifactKey.Arn
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: true
+        Image: !ImportValue aws-shared-services-pipeline-BuildEnvImage
+        EnvironmentVariables:
+          - Name: ARTIFACT_STORE
+            Value: !Ref ArtifactStore
+          - Name: REPOSITORY_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${DockerRepo}
+          - Name: DEV_ACCOUNT_ID
+            Value: !Ref DevAccountId
+          - Name: QUAL_ACCOUNT_ID
+            Value: !Ref QualAccountId
+          - Name: PROD_ACCOUNT_ID
+            Value: !Ref ProdAccountId
+      Cache:
+        Type: LOCAL
+        Modes: [LOCAL_DOCKER_LAYER_CACHE]
+      Source:
+        Type: CODEPIPELINE
+      Artifacts:
+        Type: CODEPIPELINE
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Ref AWS::StackName
+      RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/Pipeline
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactStore
+        EncryptionKey:
+          Id: !GetAtt ArtifactKey.Arn
+          Type: KMS
+      RestartExecutionOnUpdate: true
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: "1"
+              OutputArtifacts:
+                - Name: sourceCode
+              Configuration:
+                OAuthToken: !Ref GithubAccessToken
+                Owner: !Ref GithubOwner
+                Repo: !Ref GithubRepo
+                Branch: !Ref GithubBranch
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              InputArtifacts:
+                - Name: sourceCode
+              OutputArtifacts:
+                - Name: buildResults
+              Configuration:
+                ProjectName: !Ref BuildProject
